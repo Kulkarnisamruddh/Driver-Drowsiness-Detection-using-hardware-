@@ -1,0 +1,535 @@
+#include "esp_camera.h"
+#include <FS.h>
+#include "SD_MMC.h"
+#include <WiFi.h>
+#include <WebServer.h>
+
+#define BUZZER_PIN 13  // GPIO 13 - safe pin for buzzer
+#define CAMERA_MODEL_AI_THINKER
+
+// AI-Thinker ESP32-CAM pin definitions
+#define PWDN_GPIO_NUM  32
+#define RESET_GPIO_NUM -1
+#define XCLK_GPIO_NUM  0
+#define SIOD_GPIO_NUM  26
+#define SIOC_GPIO_NUM  27
+#define Y9_GPIO_NUM    35
+#define Y8_GPIO_NUM    34
+#define Y7_GPIO_NUM    39
+#define Y6_GPIO_NUM    36
+#define Y5_GPIO_NUM    21
+#define Y4_GPIO_NUM    19
+#define Y3_GPIO_NUM    18
+#define Y2_GPIO_NUM    5
+#define VSYNC_GPIO_NUM 25
+#define HREF_GPIO_NUM  23
+#define PCLK_GPIO_NUM  22
+
+WebServer server(80);
+
+// Drowsiness detection variables
+unsigned long eyesClosedStartTime = 0;
+const unsigned long DROWSY_THRESHOLD = 3000;
+bool buzzerActive = false;
+unsigned long buzzerStartTime = 0;
+const unsigned long BUZZER_DURATION = 5000;
+
+// Stability variables - prevent flickering detection
+const int READING_BUFFER_SIZE = 5;
+bool eyeStateBuffer[READING_BUFFER_SIZE] = {false};
+int bufferIndex = 0;
+int closedCount = 0;
+
+// Calibration variables
+int baselineBrightness = 100;
+bool calibrated = false;
+int calibrationFrames = 0;
+const int CALIBRATION_NEEDED = 20;
+
+// PWM properties for buzzer
+const int buzzerFreq = 2000;
+const int buzzerChannel = 15;  // Use channel 15 to avoid camera conflicts
+const int buzzerResolution = 8;
+
+// Function declarations
+void handleRoot();
+void handleStream();
+void handleCapture();
+bool detectEyesClosed(camera_fb_t *fb);
+bool isStableEyesClosed();
+void addToBuffer(bool eyesClosed);
+void activateAlert(camera_fb_t *fb);
+void deactivateAlert();
+void buzzerBeep(bool on);
+void calibrateBaseline(camera_fb_t *fb);
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n=== ESP32-CAM Drowsiness Detection System ===");
+  
+  // Configure buzzer pin as output first
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+  
+  // Setup PWM for buzzer (compatible with both old and new ESP32 core)
+  #if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
+    // New API for ESP32 core 3.0+
+    ledcAttach(BUZZER_PIN, buzzerFreq, buzzerResolution);
+  #else
+    // Old API for ESP32 core 2.x
+    ledcSetup(buzzerChannel, buzzerFreq, buzzerResolution);
+    ledcAttachPin(BUZZER_PIN, buzzerChannel);
+  #endif
+  
+  // Test buzzer on startup
+  Serial.println("Testing buzzer...");
+  for(int i = 0; i < 3; i++) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(100);
+    digitalWrite(BUZZER_PIN, LOW);
+    delay(100);
+  }
+  Serial.println("Buzzer test complete");
+
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.frame_size = FRAMESIZE_QVGA;
+  config.jpeg_quality = 12;
+  config.fb_count = 2;
+  config.grab_mode = CAMERA_GRAB_LATEST;
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed with error 0x%x\n", err);
+    return;
+  }
+  Serial.println("✓ Camera initialized successfully");
+
+  sensor_t *s = esp_camera_sensor_get();
+  s->set_brightness(s, 0);
+  s->set_contrast(s, 1);
+  s->set_saturation(s, 0);
+  s->set_hmirror(s, 0);
+  s->set_vflip(s, 0);
+  s->set_whitebal(s, 1);
+  s->set_awb_gain(s, 1);
+  s->set_wb_mode(s, 0);
+
+  if (!SD_MMC.begin("/sdcard", true)) {
+    Serial.println("⚠ SD Card mount failed - images won't be saved");
+  } else {
+    uint8_t cardType = SD_MMC.cardType();
+    if (cardType == CARD_NONE) {
+      Serial.println("⚠ No SD card attached");
+    } else {
+      Serial.println("✓ SD Card mounted successfully");
+    }
+  }
+
+  const char* ssid = "ESP";
+  const char* password = "87654321";
+
+  Serial.println("\nConnecting to WiFi...");
+  WiFi.begin(ssid, password);
+
+  unsigned long startAttempt = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 10000) {
+    Serial.print(".");
+    delay(500);
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("\n⚠ WiFi connection failed! Starting AP mode...");
+    WiFi.softAP("ESP32CAM_Drowsy", "12345678");
+    Serial.print("AP IP Address: ");
+    Serial.println(WiFi.softAPIP());
+  } else {
+    Serial.println("\n✓ WiFi connected!");
+    Serial.print("Camera IP Address: http://");
+    Serial.println(WiFi.localIP());
+  }
+
+  server.on("/", handleRoot);
+  server.on("/stream", handleStream);
+  server.on("/capture", handleCapture);
+  server.begin();
+  
+  Serial.println("\n=== System Ready ===");
+  Serial.println("🔧 Calibrating... Keep eyes OPEN for 5 seconds");
+}
+
+void handleRoot() {
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Drowsiness Detection</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      text-align: center;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+      padding: 20px;
+      margin: 0;
+    }
+    .container {
+      max-width: 800px;
+      margin: 0 auto;
+      background: rgba(255, 255, 255, 0.1);
+      border-radius: 20px;
+      padding: 30px;
+      backdrop-filter: blur(10px);
+    }
+    h1 { margin-top: 0; font-size: 2em; }
+    .status {
+      padding: 15px;
+      margin: 20px 0;
+      border-radius: 10px;
+      font-size: 1.2em;
+      font-weight: bold;
+    }
+    .monitoring { background: rgba(76, 175, 80, 0.3); }
+    .warning { background: rgba(255, 193, 7, 0.3); }
+    .alert { background: rgba(244, 67, 54, 0.3); animation: pulse 1s infinite; }
+    .calibrating { background: rgba(33, 150, 243, 0.3); }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.6; }
+    }
+    img {
+      width: 100%;
+      max-width: 640px;
+      border-radius: 10px;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+    }
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 15px;
+      margin-top: 20px;
+    }
+    .stat-box {
+      background: rgba(255, 255, 255, 0.2);
+      padding: 15px;
+      border-radius: 10px;
+    }
+    .stat-label {
+      font-size: 0.9em;
+      opacity: 0.8;
+    }
+    .stat-value {
+      font-size: 1.5em;
+      font-weight: bold;
+      margin-top: 5px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>🚗 Driver Drowsiness Detection</h1>
+    <div id="status" class="status monitoring">Initializing...</div>
+    <img src="/stream" alt="Camera Stream">
+    <div class="stats">
+      <div class="stat-box">
+        <div class="stat-label">Eyes Closed Time</div>
+        <div class="stat-value" id="timer">0.0s</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Alert Threshold</div>
+        <div class="stat-value">3.0s</div>
+      </div>
+    </div>
+    <div class="info" style="margin-top: 20px; font-size: 0.9em; opacity: 0.9;">
+      <p>⚠ Alert triggers after 3 seconds of closed eyes</p>
+      <p>System uses stability detection to prevent false alerts</p>
+    </div>
+  </div>
+  <script>
+    let eyesClosedTime = 0;
+    let wasAlert = false;
+    
+    setInterval(() => {
+      fetch('/capture')
+        .then(r => r.text())
+        .then(status => {
+          const statusDiv = document.getElementById('status');
+          
+          if (status.includes('CALIBRATING')) {
+            statusDiv.className = 'status calibrating';
+            statusDiv.textContent = '🔧 Calibrating... Keep eyes OPEN';
+            eyesClosedTime = 0;
+          } else if (status.includes('ALERT')) {
+            statusDiv.className = 'status alert';
+            statusDiv.textContent = '🚨 DROWSINESS DETECTED!';
+            wasAlert = true;
+          } else if (status.includes('CLOSED')) {
+            statusDiv.className = 'status warning';
+            statusDiv.textContent = '⚠ Eyes Closed...';
+            eyesClosedTime += 0.5;
+          } else {
+            statusDiv.className = 'status monitoring';
+            statusDiv.textContent = '✓ Driver Alert';
+            if (wasAlert || eyesClosedTime > 0) {
+              eyesClosedTime = 0;
+              wasAlert = false;
+            }
+          }
+          
+          document.getElementById('timer').textContent = eyesClosedTime.toFixed(1) + 's';
+        })
+        .catch(err => {
+          console.log('Connection error:', err);
+        });
+    }, 500);
+  </script>
+</body>
+</html>
+)rawliteral";
+  server.send(200, "text/html", html);
+}
+
+void handleStream() {
+  WiFiClient client = server.client();
+  String response = "HTTP/1.1 200 OK\r\n";
+  response += "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
+  server.sendContent(response);
+
+  while (client.connected()) {
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) {
+      Serial.println("Camera capture failed");
+      break;
+    }
+
+    // Calibration phase
+    if (!calibrated) {
+      calibrateBaseline(fb);
+      if (calibrationFrames >= CALIBRATION_NEEDED) {
+        calibrated = true;
+        Serial.println("✓ Calibration complete!");
+        Serial.printf("Baseline brightness: %d\n", baselineBrightness);
+      }
+    } else {
+      // Detection phase
+      bool currentEyesClosed = detectEyesClosed(fb);
+      addToBuffer(currentEyesClosed);
+      
+      bool stableEyesClosed = isStableEyesClosed();
+      
+      if (stableEyesClosed) {
+        if (eyesClosedStartTime == 0) {
+          eyesClosedStartTime = millis();
+          Serial.println("👁 Eyes CLOSED (stable detection)");
+        }
+        
+        unsigned long closedDuration = millis() - eyesClosedStartTime;
+        
+        if (closedDuration >= DROWSY_THRESHOLD && !buzzerActive) {
+          activateAlert(fb);
+        }
+      } else {
+        if (eyesClosedStartTime != 0) {
+          Serial.println("👁 Eyes OPEN");
+        }
+        eyesClosedStartTime = 0;
+        deactivateAlert();
+      }
+    }
+
+    // Send frame
+    String part = "--frame\r\n";
+    part += "Content-Type: image/jpeg\r\n";
+    part += "Content-Length: " + String(fb->len) + "\r\n\r\n";
+    server.sendContent(part);
+    client.write(fb->buf, fb->len);
+    server.sendContent("\r\n");
+
+    esp_camera_fb_return(fb);
+    
+    if (!client.connected()) break;
+    delay(200);
+  }
+}
+
+void handleCapture() {
+  if (!calibrated) {
+    server.send(200, "text/plain", "CALIBRATING");
+    return;
+  }
+  
+  if (buzzerActive) {
+    server.send(200, "text/plain", "ALERT");
+  } else if (isStableEyesClosed()) {
+    server.send(200, "text/plain", "CLOSED");
+  } else {
+    server.send(200, "text/plain", "OK");
+  }
+}
+
+void calibrateBaseline(camera_fb_t *fb) {
+  int totalBrightness = 0;
+  int samples = 0;
+  
+  // Sample entire frame during calibration
+  for (int i = 0; i < fb->len; i += 1000) {
+    totalBrightness += fb->buf[i];
+    samples++;
+  }
+  
+  if (samples > 0) {
+    int currentBrightness = totalBrightness / samples;
+    baselineBrightness = (baselineBrightness * calibrationFrames + currentBrightness) / (calibrationFrames + 1);
+  }
+  
+  calibrationFrames++;
+}
+
+void addToBuffer(bool eyesClosed) {
+  // Remove old value from count
+  if (eyeStateBuffer[bufferIndex]) {
+    closedCount--;
+  }
+  
+  // Add new value
+  eyeStateBuffer[bufferIndex] = eyesClosed;
+  if (eyesClosed) {
+    closedCount++;
+  }
+  
+  bufferIndex = (bufferIndex + 1) % READING_BUFFER_SIZE;
+}
+
+bool isStableEyesClosed() {
+  // Eyes are considered closed if majority of recent readings say so
+  return (closedCount >= 3);  // 3 out of 5 readings
+}
+
+bool detectEyesClosed(camera_fb_t *fb) {
+  int eyeRegionBrightness = 0;
+  int faceRegionBrightness = 0;
+  int eyeSamples = 0;
+  int faceSamples = 0;
+  
+  // Sample eye region (top 1/4 of image)
+  for (int i = fb->len / 8; i < fb->len / 4; i += 400) {
+    eyeRegionBrightness += fb->buf[i];
+    eyeSamples++;
+  }
+  
+  // Sample face region (middle section)
+  for (int i = fb->len / 3; i < (2 * fb->len) / 3; i += 600) {
+    faceRegionBrightness += fb->buf[i];
+    faceSamples++;
+  }
+  
+  if (eyeSamples > 0) eyeRegionBrightness /= eyeSamples;
+  if (faceSamples > 0) faceRegionBrightness /= faceSamples;
+  
+  // Calculate thresholds based on calibrated baseline
+  int closedThreshold = baselineBrightness * 0.6;  // 60% of baseline
+  int contrastThreshold = baselineBrightness * 0.15;  // 15% difference required
+  
+  // Eyes closed if:
+  // 1. Eye region is significantly darker than baseline
+  // 2. Eye region is darker than face region by a margin
+  bool eyesAreClosed = (eyeRegionBrightness < closedThreshold) && 
+                       ((faceRegionBrightness - eyeRegionBrightness) > contrastThreshold);
+  
+  return eyesAreClosed;
+}
+
+void activateAlert(camera_fb_t *fb) {
+  if (buzzerActive) return;
+  
+  buzzerActive = true;
+  buzzerStartTime = millis();
+  Serial.println("\n🚨🚨🚨 DROWSINESS ALERT! 🚨🚨🚨");
+  
+  buzzerBeep(true);
+  
+  String filename = "/drowsy_" + String(millis()) + ".jpg";
+  File file = SD_MMC.open(filename.c_str(), FILE_WRITE);
+  
+  if (file) {
+    file.write(fb->buf, fb->len);
+    file.close();
+    Serial.println("📸 Alert image saved: " + filename);
+  } else {
+    Serial.println("❌ Failed to save alert image");
+  }
+}
+
+void deactivateAlert() {
+  if (buzzerActive) {
+    buzzerActive = false;
+    buzzerBeep(false);
+    Serial.println("✅ Alert deactivated - driver is alert");
+  }
+}
+
+void buzzerBeep(bool on) {
+  if (on) {
+    // Try multiple methods to ensure buzzer works
+    Serial.println("🔊 BUZZER ON");
+    
+    #if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
+      // New API for ESP32 core 3.0+
+      ledcWriteTone(BUZZER_PIN, buzzerFreq);
+      ledcWrite(BUZZER_PIN, 128);  // 50% duty cycle
+    #else
+      // Old API for ESP32 core 2.x
+      ledcWriteTone(buzzerChannel, buzzerFreq);
+      ledcWrite(buzzerChannel, 128);
+    #endif
+    
+    // Also try direct GPIO (for active buzzers)
+    digitalWrite(BUZZER_PIN, HIGH);
+  } else {
+    Serial.println("🔇 BUZZER OFF");
+    
+    #if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
+      // New API
+      ledcWrite(BUZZER_PIN, 0);
+      ledcWriteTone(BUZZER_PIN, 0);
+    #else
+      // Old API
+      ledcWrite(buzzerChannel, 0);
+      ledcWriteTone(buzzerChannel, 0);
+    #endif
+    
+    // Turn off GPIO
+    digitalWrite(BUZZER_PIN, LOW);
+  }
+}
+
+void loop() {
+  server.handleClient();
+  
+  if (buzzerActive && (millis() - buzzerStartTime > BUZZER_DURATION)) {
+    buzzerBeep(false);
+    Serial.println("⏰ Buzzer timeout - continuing to monitor");
+  }
+  
+  delay(10);
+}
