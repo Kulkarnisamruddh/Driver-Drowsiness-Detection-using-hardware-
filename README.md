@@ -92,7 +92,12 @@ Car Safety Dashboard
 
 4. Click Upload
 
+🌐 Access Camera Stream
 
+After ESP32 connects to WiFi:
+
+Camera Stream URL:
+http://<your-ESP32-IP>
 5. After upload → remove IO0-GND jumper → press RESET
 
    📄 License
