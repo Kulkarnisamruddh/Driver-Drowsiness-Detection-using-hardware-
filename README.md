@@ -105,7 +105,7 @@ MIT License
 🚀 Author
 
 Samruddhi, Radhika, Sneha, Renuka (4rd Year AI & ML)
-Project: Driver Drowsiness & Alcohol Detection
+Project: Driver Drowsiness Detection 
 Guided by: Samruddhi Chillure 
 
 
