@@ -15,8 +15,6 @@ Power Supply 5V
 
 (Optional) Buzzer / LED / Mobile Alert Integration
 
-
-
 ---
 
 🧩 System Features
@@ -59,9 +57,6 @@ WiFi.h
 
 ESPAsyncWebServer (if web UI used)
 
-
-
-
 ---
 
 ▶️ How to Upload Code
@@ -80,12 +75,41 @@ Upload Speed: 115200
 
 Flash Size: 4MB
 
+🧠 Future Scope
+
+Add Mobile App Alerts (Blynk / Firebase)
+
+Alcohol Detection Sensor
+
+Tire Pressure & Temperature Monitoring
+
+Car Safety Dashboard
+
+
+
+---
 
 
 4. Click Upload
 
 
 5. After upload → remove IO0-GND jumper → press RESET
+
+   📄 License
+
+MIT License
+
+
+---
+
+🚀 Author
+
+Samruddhi, Radhika, Sneha, Renuka (4rd Year AI & ML)
+Project: Driver Drowsiness & Alcohol Detection
+Guided by: Samruddhi Chillure 
+
+
+---
 
 
 
