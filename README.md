@@ -104,16 +104,11 @@ http://<your-ESP32-IP>
 
 MIT License
 
-
 ---
-
 🚀 Author
 
-Samruddhi, Radhika, Sneha, Renuka (4rd Year AI & ML)
+Samruddhi, (4rd Year AI & ML)
 Project: Driver Drowsiness Detection 
-Guided by: Samruddhi Chillure 
-
-
 ---
 
 
